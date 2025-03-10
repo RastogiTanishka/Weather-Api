@@ -1,12 +1,15 @@
 from flask import Flask, request, jsonify
 import requests
 import psycopg2
-from psycopg2 import sql
-from datetime import date
+import redis
+from datetime import date, timedelta
 from psycopg2.extras import RealDictCursor
-
+import json
 
 app = Flask(__name__)
+
+# Redis configuration
+redis_client = redis.StrictRedis(host='localhost', port=6379, db=0, decode_responses=True)
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 DB_CONFIG = {
@@ -25,21 +28,31 @@ def log_forecast(lat, lng, temperature, forecast_date=None):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
-        
-        query = sql.SQL("""
-            INSERT INTO weather_forecast(latitude, longitude, forecast_date, temperature)
-            VALUES (%s, %s, %s, %s);
-        """)
-        
-        cur.execute(query, (lat, lng, forecast_date, temperature))
-        conn.commit()
-        
-        print(f"✅ Logged forecast: lat={lat}, lng={lng}, date={forecast_date}, temp={temperature}°C")
-        
+
+        # Check if the record already exists
+        check_query = """
+            SELECT 1 FROM weather_forecast
+            WHERE latitude = %s AND longitude = %s AND forecast_date = %s;
+        """
+        cur.execute(check_query, (lat, lng, forecast_date))
+        existing_record = cur.fetchone()
+
+        if existing_record:
+            response = {"message": "Forecast already logged", "latitude": lat, "longitude": lng, "date": str(forecast_date)}
+        else:
+            query = """
+                INSERT INTO weather_forecast(latitude, longitude, forecast_date, temperature)
+                VALUES (%s, %s, %s, %s);
+            """
+            cur.execute(query, (lat, lng, forecast_date, temperature))
+            conn.commit()
+            response = {"message": "Forecast logged successfully", "latitude": lat, "longitude": lng, "date": str(forecast_date), "temperature": temperature}
+
         cur.close()
         conn.close()
+        return response
     except Exception as e:
-        print(f"❌ Error: {e}")
+        return {"error": str(e)}
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
@@ -84,6 +97,12 @@ def forecast():
     if not lat or not lon:
         return jsonify({"error": "Missing lat or lon parameters"}), 400
 
+    cache_key = f"forecast:{lat}:{lon}"
+    cached_data = redis_client.get(cache_key)
+
+    if cached_data:
+        return jsonify(json.loads(cached_data))
+
     try:
         response = requests.get(
             OPEN_METEO_URL,
@@ -100,20 +119,16 @@ def forecast():
         if "current" not in data or "temperature_2m" not in data["current"]:
             return jsonify({"error": "Invalid response from weather API"}), 500
 
-        log_forecast(lat, lon, data["current"]["temperature_2m"])
+        forecast_response = log_forecast(lat, lon, data["current"]["temperature_2m"])
+        redis_client.setex(cache_key, 600, json.dumps(forecast_response))  # Cache for 10 minutes
 
-        return jsonify({
-            "latitude": lat,
-            "longitude": lon,
-            "temperature_celsius": data["current"]["temperature_2m"]
-        })
+        return jsonify(forecast_response)
 
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Request failed: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
 
 # test command:
 # http://localhost:5000/logs?start_date=2025-03-01&end_date=2025-03-10
